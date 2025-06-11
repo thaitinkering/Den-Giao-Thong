@@ -2,52 +2,54 @@ import socket
 import struct
 import cv2
 import numpy as np
+import time
 
-# ====== THÔNG TIN ESP32 CAM ======
-ESP32_IP = "192.168.100.2"   # ⚠️ NHỚ thay bằng IP thật từ Serial Monitor
-ESP32_PORT = 9999
+def receive_all(sock, size):
+    data = b''
+    while len(data) < size:
+        packet = sock.recv(size - len(data))
+        if not packet:
+            raise ConnectionError("Mất kết nối hoặc thiếu dữ liệu")
+        data += packet
+    return data
 
-# ====== TẠO CLIENT SOCKET ======
-client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client.connect((ESP32_IP, ESP32_PORT))
-print("✅ Đã kết nối ESP32-CAM tại", ESP32_IP)
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(("0.0.0.0", 9999))
+server.listen(1)
+print("🟢 Đang chờ ESP32 kết nối...")
 
-try:
-    while True:
-        # ====== BƯỚC 1: Nhận độ dài ảnh (4 byte) ======
-        raw_len = client.recv(4)
-        if not raw_len:
-            print("❌ Không nhận được độ dài ảnh!")
-            break
+client, addr = server.accept()
+print(f"✅ ESP32 đã kết nối từ {addr}")
+
+frame_count = 0
+start_time = time.time()
+
+while True:
+    try:
+        raw_len = receive_all(client, 4)
         img_len = struct.unpack('<I', raw_len)[0]
 
-        # ====== BƯỚC 2: Nhận toàn bộ ảnh JPEG ======
-        img_data = b''
-        while len(img_data) < img_len:
-            chunk = client.recv(min(4096, img_len - len(img_data)))
-            if not chunk:
-                print("⚠️ Mất dữ liệu trong quá trình nhận ảnh.")
-                break
-            img_data += chunk
+        img_data = receive_all(client, img_len)
+        checksum_recv = struct.unpack('<I', receive_all(client, 4))[0]
+        checksum_calc = sum(img_data)
 
-        # ====== BƯỚC 3: Giải mã ảnh JPEG bằng OpenCV ======
-        np_arr = np.frombuffer(img_data, np.uint8)
-        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if checksum_recv != checksum_calc:
+            print("❌ Checksum lỗi – bỏ frame")
+            continue
 
-        # ====== BƯỚC 4: Hiển thị ảnh ======
-        if frame is not None:
-            cv2.imshow("ESP32-CAM Live", frame)
-        else:
-            print("⚠️ Không giải mã được ảnh!")
+        img = cv2.imdecode(np.frombuffer(img_data, dtype=np.uint8), 1)
+        if img is not None:
+            cv2.imshow("ESP32 TCP Stream", img)
+            frame_count += 1
 
-        # Nhấn Q để thoát
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if cv2.waitKey(1) == 27:
             break
+    except Exception as e:
+        print(f"⚠️ Lỗi: {e}")
+        break
 
-except KeyboardInterrupt:
-    print("\n🛑 Dừng bởi người dùng.")
+elapsed = time.time() - start_time
+print(f"Tổng số ảnh: {frame_count} – FPS: {frame_count / elapsed:.2f}")
 
-finally:
-    client.close()
-    cv2.destroyAllWindows()
-    print("🔒 Kết nối TCP đã đóng.")
+client.close()
+server.close()
