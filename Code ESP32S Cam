@@ -1,22 +1,24 @@
-#include <WiFi.h>
+#include <WiFi.h> 
 #include <esp_camera.h>
 
-// 🟩 WiFi & Server cấu hình
+// ⚙️ Thông tin mạng và server
 const char* ssid = "Dong Bui";
 const char* password = "123456789";
 const char* server_ip = "192.168.1.165";
 const uint16_t server_port = 9999;
 
-WiFiClient client;  // 🔁 Giữ kết nối TCP toàn cục
+WiFiClient client;
+unsigned long lastReconnectAttempt = 0;
+const unsigned long reconnectInterval = 5000;
 
-// 🧮 Hàm tính checksum đơn giản
+// ✅ Tính checksum đơn giản
 uint32_t calculateChecksum(const uint8_t* data, size_t len) {
   uint32_t sum = 0;
   for (size_t i = 0; i < len; ++i) sum += data[i];
   return sum;
 }
 
-// 📸 Cấu hình camera cho AI Thinker
+// 📷 Cấu hình camera cho AI Thinker
 void setupCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -46,44 +48,47 @@ void setupCamera() {
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed: 0x%x\n", err);
+    Serial.printf("❌ Camera init failed: 0x%x\n", err);
     ESP.restart();
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("🔌 Kết nối WiFi...");
+  Serial.println("🔌 Đang kết nối WiFi...");
+
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
+    delay(500);
     Serial.print(".");
   }
   Serial.println("\n✅ Đã kết nối WiFi");
+  Serial.print("📍 IP: ");
+  Serial.println(WiFi.localIP());
 
   setupCamera();
 }
 
-// 🔁 Hàm gửi ảnh 1 lần qua TCP
+// 📤 Gửi 1 ảnh qua TCP
 bool sendImage() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
-    Serial.println("❌ Lỗi: Không chụp được ảnh");
+    Serial.println("❌ Không lấy được ảnh");
     return false;
   }
 
   uint32_t img_len = fb->len;
-  uint32_t checksum = calculateChecksum(fb->buf, fb->len);
+  uint32_t checksum = calculateChecksum(fb->buf, img_len);
 
-  // Gửi dữ liệu
+  // Gửi độ dài, ảnh, checksum
   bool success = client.write((uint8_t*)&img_len, 4) == 4 &&
-                 client.write(fb->buf, fb->len) == fb->len &&
+                 client.write(fb->buf, img_len) == img_len &&
                  client.write((uint8_t*)&checksum, 4) == 4;
 
-  esp_camera_fb_return(fb);  // Trả buffer
+  esp_camera_fb_return(fb);
 
   if (!success) {
-    Serial.println("⚠️ Gửi ảnh thất bại. Mất kết nối?");
+    Serial.println("⚠️ Gửi ảnh thất bại");
     return false;
   }
 
@@ -91,24 +96,36 @@ bool sendImage() {
 }
 
 void loop() {
-  // 🟡 Kết nối lại nếu mất
+  // 🔁 Kiểm tra WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("📴 Mất WiFi. Đang reconnect...");
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+    delay(1000);
+    return;
+  }
+
+  // 🔄 Reconnect TCP nếu mất
   if (!client.connected()) {
-    Serial.print("🔄 Kết nối lại TCP... ");
-    client.stop();
-    if (client.connect(server_ip, server_port)) {
-      Serial.println("✅ OK");
-    } else {
-      Serial.println("❌ Thất bại");
-      delay(500);  // chờ trước khi thử lại
-      return;
+    unsigned long now = millis();
+    if (now - lastReconnectAttempt > reconnectInterval) {
+      Serial.println("🔄 Thử kết nối lại TCP...");
+      client.stop();
+      if (client.connect(server_ip, server_port)) {
+        Serial.println("✅ Kết nối TCP thành công!");
+      } else {
+        Serial.println("❌ Kết nối TCP thất bại.");
+      }
+      lastReconnectAttempt = now;
     }
+    delay(50);
+    return;
   }
 
-  // 🚀 Gửi ảnh nếu kết nối thành công
+  // 🚀 Gửi ảnh nếu kết nối ổn định
   if (!sendImage()) {
-    client.stop();  // mất kết nối hoặc lỗi → đóng rồi sẽ reconnect ở vòng sau
+    client.stop();  // sẽ reconnect ở vòng sau
   }
 
-  // ⚠️ Không delay lâu, để có tốc độ cao
-  delay(30);  // giúp buffer không bị đầy nếu máy tính yếu
+  delay(30);  // tránh nghẽn buffer
 }
