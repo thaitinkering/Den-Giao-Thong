@@ -4,52 +4,85 @@ import cv2
 import numpy as np
 import time
 
-HOST = "0.0.0.0"
-PORT = 9999
-RECV_TIMEOUT = 5.0  # nếu 5s không recv được dữ liệu => timeout
+# Cấu hình
+HOST        = "0.0.0.0"
+PORT        = 9999
+RECV_TIMEOUT= 5.0    # giây chờ giữa các recv
+WARMUP_FRAMES = 5    # số frame đầu chỉ đọc mà không hiển thị
 
 def receive_all(sock, size):
+    """Nhận đúng 'size' byte; raise ConnectionError nếu timeout hoặc socket đóng."""
     data = b''
     start = time.time()
     while len(data) < size:
+        if time.time() - start > RECV_TIMEOUT:
+            raise ConnectionError("⚠️ Timeout khi recv dữ liệu")
         try:
             packet = sock.recv(size - len(data))
         except socket.timeout:
-            raise ConnectionError("⚠️ Timeout recv — có thể ESP đã ngắt")
+            raise ConnectionError("⚠️ Timeout khi recv dữ liệu")
         if not packet:
-            raise ConnectionError("⚠️ ESP đã đóng kết nối")
+            raise ConnectionError("⚠️ Socket đã đóng")
         data += packet
     return data
 
 def handle_client(client, addr):
+    """Xử lý luồng nhận ảnh từ ESP32, bỏ warm-up frames trước khi hiển thị."""
     print(f"✅ ESP32 đã kết nối từ {addr}")
-    frame_count, start_time = 0, time.time()
+    client.settimeout(RECV_TIMEOUT)
+
+    # Warm-up: đọc và bỏ qua vài frame đầu
+    for i in range(WARMUP_FRAMES):
+        raw_len = receive_all(client, 4)
+        img_len = struct.unpack('<I', raw_len)[0]
+        _ = receive_all(client, img_len)
+        _ = receive_all(client, 4)
+        print(f"🔧 Warm-up frame {i+1}/{WARMUP_FRAMES}")
+
+    print("🎬 Bắt đầu hiển thị ảnh")
+
+    frame_count = 0
+    start_time = time.time()
+
     try:
         while True:
+            # 1) Nhận 4 byte độ dài
             raw_len = receive_all(client, 4)
             img_len = struct.unpack('<I', raw_len)[0]
 
+            # 2) Nhận img_len byte ảnh
             img_data = receive_all(client, img_len)
-            checksum_recv = struct.unpack('<I', receive_all(client, 4))[0]
-            if checksum_recv != sum(img_data):
-                print("❌ Checksum lỗi")
+
+            # 3) Nhận 4 byte checksum
+            raw_ck = receive_all(client, 4)
+            recv_ck = struct.unpack('<I', raw_ck)[0]
+            calc_ck = sum(img_data)
+            if recv_ck != calc_ck:
+                print("❌ Checksum lỗi – bỏ frame")
                 continue
 
-            img = cv2.imdecode(np.frombuffer(img_data, np.uint8), 1)
+            # 4) Giải mã & hiển thị
+            img = cv2.imdecode(
+                np.frombuffer(img_data, dtype=np.uint8),
+                cv2.IMREAD_COLOR
+            )
             if img is not None:
                 cv2.imshow("ESP32 TCP Stream", img)
                 frame_count += 1
 
+            # Nhấn ESC để ngắt
             if cv2.waitKey(1) == 27:
-                print("⛔ Dừng server theo yêu cầu")
-                return
+                print("⛔ Nhấn ESC, dừng client")
+                break
+
     except ConnectionError as e:
         print(e)
     finally:
-        client.close()
         elapsed = time.time() - start_time
-        fps = frame_count/elapsed if elapsed>0 else 0
-        print(f"🔒 Đóng kết nối, frames={frame_count}, FPS={fps:.2f}")
+        fps = frame_count / elapsed if elapsed > 0 else 0
+        print(f"🔒 Đóng kết nối {addr}. Frames: {frame_count}, FPS: {fps:.2f}\n")
+        client.close()
+        cv2.destroyAllWindows()
 
 def run_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -60,11 +93,9 @@ def run_server():
 
     try:
         while True:
-            client, addr = server.accept()
-            # *** Thiết lập timeout cho client socket ***
-            client.settimeout(RECV_TIMEOUT)
-            handle_client(client, addr)
             print("🔄 Chờ ESP32 kết nối lại...")
+            client, addr = server.accept()
+            handle_client(client, addr)
     except KeyboardInterrupt:
         print("✋ Server dừng thủ công")
     finally:
