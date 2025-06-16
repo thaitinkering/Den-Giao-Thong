@@ -1,131 +1,202 @@
-#include <WiFi.h> 
+#include <WiFi.h>
 #include <esp_camera.h>
+#include <esp_sleep.h>
 
-// ⚙️ Thông tin mạng và server
-const char* ssid = "Dong Bui";
-const char* password = "123456789";
-const char* server_ip = "192.168.1.165";
-const uint16_t server_port = 9999;
+// ──────────────────────────────────────────────────────────────
+//                 CONFIGURATION & CONSTANTS
+// ──────────────────────────────────────────────────────────────
 
-WiFiClient client;
-unsigned long lastReconnectAttempt = 0;
-const unsigned long reconnectInterval = 5000;
+// Wi-Fi credentials
+const char* WIFI_SSID     = "Dong Bui";
+const char* WIFI_PASSWORD = "123456789";
 
-// ✅ Tính checksum đơn giản
+// TCP server details
+const char* SERVER_IP     = "192.168.1.165";
+const uint16_t SERVER_PORT = 9999;
+
+// Timing intervals (ms)
+const unsigned long WIFI_RECONNECT_INTERVAL    = 5000;
+const unsigned long TCP_RECONNECT_INTERVAL     = 5000;
+const unsigned long FRAME_SEND_TIMEOUT         = 10000;
+
+// After this many TCP failures, trigger a soft reset via deep-sleep
+const int MAX_TCP_FAILURES = 5;
+
+// Camera parameters
+#define CAMERA_FRAME_SIZE    FRAMESIZE_240X240
+#define CAMERA_JPEG_QUALITY  12
+#define CAMERA_FB_COUNT      2
+
+// Deep-sleep duration (μs) to simulate reset
+const uint64_t SLEEP_DURATION_US = 2e6;  // 2 seconds
+
+// ──────────────────────────────────────────────────────────────
+//                        GLOBAL STATE
+// ──────────────────────────────────────────────────────────────
+
+WiFiClient   tcpClient;
+unsigned long lastWiFiAttempt    = 0;
+unsigned long lastTCPAttempt     = 0;
+unsigned long lastFrameSentAt    = 0;
+int           tcpFailCount       = 0;
+
+// ──────────────────────────────────────────────────────────────
+//                          HELPERS
+// ──────────────────────────────────────────────────────────────
+
 uint32_t calculateChecksum(const uint8_t* data, size_t len) {
   uint32_t sum = 0;
   for (size_t i = 0; i < len; ++i) sum += data[i];
   return sum;
 }
 
-// 📷 Cấu hình camera cho AI Thinker
+void enterDeepSleep() {
+  Serial.println("🔄 Entering deep sleep for soft reset...");
+  esp_deep_sleep(SLEEP_DURATION_US);
+}
+
+// Initialize camera with double buffering
 void setupCamera() {
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = 5;
-  config.pin_d1 = 18;
-  config.pin_d2 = 19;
-  config.pin_d3 = 21;
-  config.pin_d4 = 36;
-  config.pin_d5 = 39;
-  config.pin_d6 = 34;
-  config.pin_d7 = 35;
-  config.pin_xclk = 0;
-  config.pin_pclk = 22;
-  config.pin_vsync = 25;
-  config.pin_href = 23;
-  config.pin_sscb_sda = 26;
-  config.pin_sscb_scl = 27;
-  config.pin_pwdn = 32;
-  config.pin_reset = -1;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
+  camera_config_t cfg = {};
+  cfg.ledc_channel    = LEDC_CHANNEL_0;
+  cfg.ledc_timer      = LEDC_TIMER_0;
+  cfg.pin_d0          = 5;
+  cfg.pin_d1          = 18;
+  cfg.pin_d2          = 19;
+  cfg.pin_d3          = 21;
+  cfg.pin_d4          = 36;
+  cfg.pin_d5          = 39;
+  cfg.pin_d6          = 34;
+  cfg.pin_d7          = 35;
+  cfg.pin_xclk        = 0;
+  cfg.pin_pclk        = 22;
+  cfg.pin_vsync       = 25;
+  cfg.pin_href        = 23;
+  cfg.pin_sscb_sda    = 26;
+  cfg.pin_sscb_scl    = 27;
+  cfg.pin_pwdn        = 32;
+  cfg.pin_reset       = -1;
+  cfg.xclk_freq_hz    = 20000000;
+  cfg.pixel_format    = PIXFORMAT_JPEG;
+  cfg.frame_size      = CAMERA_FRAME_SIZE;
+  cfg.jpeg_quality    = CAMERA_JPEG_QUALITY;
+  cfg.fb_count        = CAMERA_FB_COUNT;
 
-  config.frame_size = FRAMESIZE_240X240;
-  config.jpeg_quality = 10;
-  config.fb_count = 1;
-
-  esp_err_t err = esp_camera_init(&config);
+  esp_err_t err = esp_camera_init(&cfg);
   if (err != ESP_OK) {
     Serial.printf("❌ Camera init failed: 0x%x\n", err);
-    ESP.restart();
+    enterDeepSleep();
   }
 }
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println("🔌 Đang kết nối WiFi...");
-
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+bool connectTCP() {
+  if (tcpClient.connect(SERVER_IP, SERVER_PORT)) {
+    tcpClient.setNoDelay(true);
+    tcpFailCount = 0;
+    Serial.println("✅ TCP connected");
+    return true;
+  } else {
+    tcpFailCount++;
+    Serial.printf("❌ TCP connect failed (%d/%d)\n", tcpFailCount, MAX_TCP_FAILURES);
+    return false;
   }
-  Serial.println("\n✅ Đã kết nối WiFi");
-  Serial.print("📍 IP: ");
-  Serial.println(WiFi.localIP());
-
-  setupCamera();
 }
 
-// 📤 Gửi 1 ảnh qua TCP
-bool sendImage() {
-  camera_fb_t *fb = esp_camera_fb_get();
+bool sendFrame() {
+  camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
-    Serial.println("❌ Không lấy được ảnh");
+    Serial.println("❌ Failed to capture frame");
     return false;
   }
 
-  uint32_t img_len = fb->len;
-  uint32_t checksum = calculateChecksum(fb->buf, img_len);
+  uint32_t len = fb->len;
+  uint32_t ck  = calculateChecksum(fb->buf, len);
 
-  // Gửi độ dài, ảnh, checksum
-  bool success = client.write((uint8_t*)&img_len, 4) == 4 &&
-                 client.write(fb->buf, img_len) == img_len &&
-                 client.write((uint8_t*)&checksum, 4) == 4;
+  bool ok = true;
+  ok &= (tcpClient.write((uint8_t*)&len, 4) == 4);
+  ok &= (tcpClient.write(fb->buf, len)   == (int)len);
+  ok &= (tcpClient.write((uint8_t*)&ck, 4) == 4);
 
   esp_camera_fb_return(fb);
 
-  if (!success) {
-    Serial.println("⚠️ Gửi ảnh thất bại");
-    return false;
+  if (ok) {
+    lastFrameSentAt = millis();
+  } else {
+    Serial.println("⚠️ Frame send failed");
   }
-
-  return true;
+  return ok;
 }
 
-void loop() {
-  // 🔁 Kiểm tra WiFi
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("📴 Mất WiFi. Đang reconnect...");
-    WiFi.disconnect();
-    WiFi.begin(ssid, password);
-    delay(1000);
-    return;
-  }
+// ──────────────────────────────────────────────────────────────
+//                               SETUP
+// ──────────────────────────────────────────────────────────────
 
-  // 🔄 Reconnect TCP nếu mất
-  if (!client.connected()) {
-    unsigned long now = millis();
-    if (now - lastReconnectAttempt > reconnectInterval) {
-      Serial.println("🔄 Thử kết nối lại TCP...");
-      client.stop();
-      if (client.connect(server_ip, server_port)) {
-        Serial.println("✅ Kết nối TCP thành công!");
-      } else {
-        Serial.println("❌ Kết nối TCP thất bại.");
-      }
-      lastReconnectAttempt = now;
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n🔌 ESP32-CAM TCP Stream starting");
+
+  // Wi-Fi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - wifiStart > 10000) {
+      Serial.println("❌ WiFi connect timeout");
+      enterDeepSleep();
     }
-    delay(50);
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.printf("\n✅ WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+
+  // Camera
+  setupCamera();
+
+  // Prime timers
+  lastWiFiAttempt  = millis();
+  lastTCPAttempt   = millis();
+  lastFrameSentAt  = millis();
+}
+
+// ──────────────────────────────────────────────────────────────
+//                                LOOP
+// ──────────────────────────────────────────────────────────────
+
+void loop() {
+  unsigned long now = millis();
+
+  // 1) Wi-Fi watchdog
+  if (WiFi.status() != WL_CONNECTED) {
+    if (now - lastWiFiAttempt >= WIFI_RECONNECT_INTERVAL) {
+      Serial.println("📴 WiFi lost, reconnecting...");
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      lastWiFiAttempt = now;
+    }
     return;
   }
 
-  // 🚀 Gửi ảnh nếu kết nối ổn định
-  if (!sendImage()) {
-    client.stop();  // sẽ reconnect ở vòng sau
+  // 2) Frame send watchdog
+  if (now - lastFrameSentAt >= FRAME_SEND_TIMEOUT) {
+    Serial.println("⏱ Frame timeout, soft-reset...");
+    enterDeepSleep();
   }
 
-  delay(30);  // tránh nghẽn buffer
+  // 3) TCP reconnect logic
+  if (!tcpClient.connected()) {
+    if (tcpFailCount >= MAX_TCP_FAILURES) {
+      Serial.println("⚠️ Too many TCP failures, soft-reset...");
+      enterDeepSleep();
+    }
+    if (now - lastTCPAttempt >= TCP_RECONNECT_INTERVAL) {
+      Serial.println("🔄 Attempting TCP reconnect...");
+      tcpClient.stop();
+      connectTCP();
+      lastTCPAttempt = now;
+    }
+    return;
+  }
+
+  // 4) Transmit next frame
+  sendFrame();
 }
