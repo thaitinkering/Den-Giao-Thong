@@ -29,6 +29,9 @@ const int MAX_TCP_FAILURES = 5;
 
 // Deep-sleep duration (μs) to simulate reset
 const uint64_t SLEEP_DURATION_US = 2e6;  // 2 seconds
+// ID Camera
+const uint8_t CAMERA_ID = 1;  // Gán ID riêng cho từng camera (1, 2, 3, 4...)
+
 
 // ──────────────────────────────────────────────────────────────
 //                        GLOBAL STATE
@@ -92,8 +95,9 @@ void setupCamera() {
 bool connectTCP() {
   if (tcpClient.connect(SERVER_IP, SERVER_PORT)) {
     tcpClient.setNoDelay(true);
+    tcpClient.write(&CAMERA_ID, 1);  // Gửi đúng 1 byte ID ngay sau connect
     tcpFailCount = 0;
-    Serial.println("✅ TCP connected");
+    Serial.printf("✅ TCP connected, sent ID: %d\n", CAMERA_ID);
     return true;
   } else {
     tcpFailCount++;
