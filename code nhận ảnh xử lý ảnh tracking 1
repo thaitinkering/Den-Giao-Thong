@@ -1,0 +1,142 @@
+import socket
+import struct
+import cv2
+import numpy as np
+import time
+from ultralytics import YOLO
+model = YOLO("yolov8n.pt")  # Hoặc model custom nếu bạn có
+import torch
+print(torch.version.cuda)
+from deep_sort_realtime.deepsort_tracker import DeepSort
+tracker = DeepSort(max_age=30)  # max_age giúp giữ ID khi mất tạm thời
+
+
+# Cấu hình
+HOST        = "0.0.0.0"
+PORT        = 9999
+RECV_TIMEOUT= 5.0    # giây chờ giữa các recv
+WARMUP_FRAMES = 5    # số frame đầu chỉ đọc mà không hiển thị
+
+def receive_all(sock, size):
+    """Nhận đúng 'size' byte; raise ConnectionError nếu timeout hoặc socket đóng."""
+    data = b''
+    start = time.time()
+    while len(data) < size:
+        if time.time() - start > RECV_TIMEOUT:
+            raise ConnectionError("⚠️ Timeout khi recv dữ liệu")
+        try:
+            packet = sock.recv(size - len(data))
+        except socket.timeout:
+            raise ConnectionError("⚠️ Timeout khi recv dữ liệu")
+        if not packet:
+            raise ConnectionError("⚠️ Socket đã đóng")
+        data += packet
+    return data
+
+def handle_client(client, addr, cam_id):
+    print(f"✅ Camera-{cam_id} đã kết nối từ {addr}")
+    client.settimeout(RECV_TIMEOUT)
+    window_name = f"Camera-{cam_id}"
+
+    for i in range(WARMUP_FRAMES):
+        raw_len = receive_all(client, 4)
+        img_len = struct.unpack('<I', raw_len)[0]
+        _ = receive_all(client, img_len)
+        _ = receive_all(client, 4)
+        print(f"🔧 Camera-{cam_id} Warm-up frame {i+1}/{WARMUP_FRAMES}")
+
+    print(f"🎬 Camera-{cam_id} bắt đầu hiển thị ảnh")
+    frame_count = 0
+    start_time = time.time()
+
+    try:
+        while True:
+            raw_len = receive_all(client, 4)
+            img_len = struct.unpack('<I', raw_len)[0]
+            img_data = receive_all(client, img_len)
+            raw_ck = receive_all(client, 4)
+            recv_ck = struct.unpack('<I', raw_ck)[0]
+            calc_ck = sum(img_data)
+            if recv_ck != calc_ck:
+                print("❌ Checksum lỗi – bỏ frame")
+                continue
+
+            img = cv2.imdecode(np.frombuffer(img_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if img is not None:
+                # 👉 YOLO detect
+                results = model(img, verbose=False)[0]
+                detections = []
+
+                if results.boxes is not None:
+                    for box, cls in zip(results.boxes.xyxy, results.boxes.cls):
+                        x1, y1, x2, y2 = map(int, box[:4])
+                        conf = float(box[4]) if len(box) > 4 else 0.0
+                        cls_name = model.names[int(cls)]
+                        detections.append(([x1, y1, x2 - x1, y2 - y1], conf, cls_name))
+
+                # 👉 Tracking
+                tracks = tracker.update_tracks(detections, frame=img)
+
+                for track in tracks:
+                    if not track.is_confirmed():
+                        continue
+                    track_id = track.track_id
+                    l, t, w, h = track.to_ltrb()
+                    x1, y1, x2, y2 = int(l), int(t), int(l + w), int(t + h)
+                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(img, f"ID {track_id}", (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+                cv2.imshow(window_name, img)
+                frame_count += 1
+
+            if cv2.waitKey(1) == 27:
+                print("⛔ Nhấn ESC, dừng client")
+                break
+
+    except ConnectionError as e:
+        print(f"⚠️ Camera-{cam_id} mất kết nối:", e)
+    finally:
+        elapsed = time.time() - start_time
+        fps = frame_count / elapsed if elapsed > 0 else 0
+        print(f"🔒 Đóng kết nối Camera-{cam_id}. Frames: {frame_count}, FPS: {fps:.2f}\n")
+        client.close()
+        cv2.destroyAllWindows()
+
+
+def run_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(1)
+    print(f"🟢 Server chạy trên {HOST}:{PORT}")
+
+    try:
+        while True:
+            print("🔄 Chờ ESP32 kết nối lại...")
+            client, addr = server.accept()
+
+            try:
+                id_byte = client.recv(1)
+                if not id_byte:
+                    print(f"❌ Client {addr} không gửi ID")
+                    client.close()
+                    continue
+
+                cam_id = id_byte[0]
+                print(f"🆔 ESP32 Camera-{cam_id} đã kết nối từ {addr}")
+                
+                handle_client(client, addr, cam_id)
+
+            except Exception as e:
+                print(f"⚠️ Lỗi khi nhận ID từ {addr}: {e}")
+                client.close()
+
+    except KeyboardInterrupt:
+        print("✋ Server dừng thủ công")
+    finally:
+        server.close()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    run_server()
