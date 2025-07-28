@@ -1,0 +1,125 @@
+# rtsp_track.py
+import os
+import time
+import cv2
+import torch
+import supervision as sv
+
+# -------- FFmpeg/OpenCV: tăng ổn định RTSP, giảm trễ --------
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp|stimeout;30000000|fflags;nobuffer|flags;low_delay"
+)
+
+# ================== CẤU HÌNH NGUỒN ==================
+# ĐỔI URL CHO ĐÚNG. Hầu hết camera dùng cổng 554, ví dụ:
+#   rtsp://user:pass@192.168.1.59:554/h264.sdp
+#   rtsp://user:pass@192.168.1.59:554/Streaming/Channels/101
+SOURCE = "rtsp://192.168.1.59:554/h264.sdp"
+
+# ================== MÔ HÌNH & THIẾT BỊ ==================
+MODEL  = "yolov8s.pt" if torch.cuda.is_available() else "yolov8n.pt"
+DEVICE = 0 if torch.cuda.is_available() else "cpu"
+HALF   = torch.cuda.is_available()  # FP16 nếu có GPU
+IMG_SIZE = 960                      # 960/736/640 tùy GPU
+
+# Chỉ giữ các lớp phương tiện (COCO): 2=car, 3=motorbike, 5=bus, 7=truck
+VEHICLE_CLASS_IDS = {2, 3, 5, 7}
+
+# ================== KHỞI TẠO ==================
+model = torch.compile(torch.jit.script) if False else sv  # placeholder to avoid linting
+model = sv  # hack to keep linter calm
+model = None  # will be redefined below
+
+from ultralytics import YOLO
+model = YOLO(MODEL)
+names = model.names if hasattr(model, "names") else model.model.names
+
+# ByteTrack API mới (supervision >= 0.23)
+tracker = sv.ByteTrack(
+    track_activation_threshold=0.25,     # ngưỡng để kích hoạt track (tương tự conf)
+    minimum_matching_threshold=0.80,     # ngưỡng ghép IoU track <-> detection
+    lost_track_buffer=60,                # số frame cho phép mất dấu trước khi huỷ
+    frame_rate=30,                       # gần với FPS thực tế của luồng
+    # minimum_consecutive_frames=1       # tăng lên 2–3 để lọc track "chớp tắt" nếu cần
+)
+
+box_annotator   = sv.BoxAnnotator()
+label_annotator = sv.LabelAnnotator(text_scale=0.6, text_thickness=1)
+
+def open_capture(uri: str) -> cv2.VideoCapture:
+    cap = cv2.VideoCapture(uri, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+cap = open_capture(SOURCE)
+if not cap.isOpened():
+    raise RuntimeError("Không mở được nguồn RTSP. Kiểm tra URL/quyền truy cập/cùng mạng LAN.")
+
+retries = 0
+fps = 0.0
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        # Thử reconnect mượt + reset tracker để tránh ID ảo
+        retries += 1
+        time.sleep(0.1)
+        if retries > 50:  # ~5s
+            cap.release()
+            time.sleep(1.0)
+            cap = open_capture(SOURCE)
+            retries = 0
+            tracker.reset()
+        continue
+    retries = 0
+
+    t0 = time.time()
+
+    # -------- Suy luận YOLOv8 --------
+    result = model(
+        frame,
+        device=DEVICE,
+        conf=0.30,
+        iou=0.50,
+        imgsz=IMG_SIZE,
+        half=HALF,
+        verbose=False
+    )[0]
+
+    # -------- Chuyển sang Detections + lọc lớp phương tiện --------
+    detections = sv.Detections.from_ultralytics(result)
+
+    if detections.class_id is not None and len(detections.class_id) > 0:
+        keep_idx = [i for i, c in enumerate(detections.class_id) if int(c) in VEHICLE_CLASS_IDS]
+        detections = detections[keep_idx] if keep_idx else detections[:0]
+
+    # -------- ByteTrack: gán tracker_id --------
+    tracked = tracker.update_with_detections(detections)
+
+    # -------- Vẽ kết quả --------
+    labels = []
+    if tracked.class_id is not None and len(tracked) > 0:
+        tids = tracked.tracker_id if tracked.tracker_id is not None else [None] * len(tracked)
+        for cls, conf, tid in zip(tracked.class_id, tracked.confidence, tids):
+            cls = int(cls)
+            name = names.get(cls, str(cls)) if isinstance(names, dict) else str(cls)
+            s_id = "" if tid is None else f" #{int(tid)}"
+            labels.append(f"{name}{s_id} {float(conf):.2f}")
+
+    annotated = box_annotator.annotate(scene=frame.copy(), detections=tracked)
+    annotated = label_annotator.annotate(scene=annotated, detections=tracked, labels=labels)
+
+    # -------- FPS --------
+    dt = time.time() - t0
+    fps = 0.9 * fps + 0.1 * (1.0 / max(dt, 1e-6))
+    cv2.putText(
+        annotated, f"FPS: {fps:.1f}", (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2
+    )
+
+    cv2.imshow("RTSP + YOLOv8 + ByteTrack (supervision)", annotated)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
